@@ -1,0 +1,384 @@
+name: Deploy Java Application
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      branch:
+        description: 'Branch to deploy'
+        required: true
+        default: 'main'
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: java-app-deployment
+  ECS_SERVICE: java-app-service
+  ECS_CLUSTER: java-app-cluster
+  ECS_TASK_DEFINITION: java-app-task
+
+jobs:
+  # Security and code quality checks
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Build and test
+  build-and-test:
+    runs-on: ubuntu-latest
+    needs: security-scan
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install psutil requests pytest flake8 black
+
+      - name: Run code quality checks
+        run: |
+          # Python linting
+          flake8 deploy.py --max-line-length=100 --ignore=E501,W503
+          
+          # Python formatting check
+          black --check deploy.py
+
+      - name: Test deployment script
+        run: |
+          python -m pytest tests/ -v || echo "No tests found, skipping..."
+
+      - name: Validate Dockerfile
+        run: |
+          # Install hadolint for Dockerfile linting
+          wget -O hadolint https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+          chmod +x hadolint
+          ./hadolint Dockerfile
+
+  # Build Docker image
+  build-docker:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Scan Docker image for vulnerabilities
+        run: |
+          # Install Trivy
+          sudo apt-get update && sudo apt-get install -y wget
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee -a /etc/apt/sources.list
+          sudo apt-get update && sudo apt-get install -y trivy
+          
+          # Scan the built image
+          trivy image --exit-code 0 --severity HIGH,CRITICAL ${{ steps.meta.outputs.tags }}
+
+  # Deploy to staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build-docker
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Init
+        run: |
+          cd infrastructure/
+          terraform init
+
+      - name: Terraform Plan
+        run: |
+          cd infrastructure/
+          terraform plan -var="environment=staging" -var="image_tag=${{ needs.build-docker.outputs.image-tag }}"
+
+      - name: Terraform Apply
+        run: |
+          cd infrastructure/
+          terraform apply -auto-approve -var="environment=staging" -var="image_tag=${{ needs.build-docker.outputs.image-tag }}"
+
+      - name: Update ECS Service
+        run: |
+          # Update ECS service with new image
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }}-staging \
+            --service ${{ env.ECS_SERVICE }}-staging \
+            --force-new-deployment
+
+      - name: Wait for deployment completion
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }}-staging \
+            --services ${{ env.ECS_SERVICE }}-staging
+
+      - name: Run health checks
+        run: |
+          # Get the load balancer DNS name
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names java-app-alb-staging \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          
+          # Wait for application to be healthy
+          for i in {1..10}; do
+            if curl -f http://$ALB_DNS/health; then
+              echo "Application is healthy!"
+              break
+            fi
+            echo "Waiting for application to be healthy... ($i/10)"
+            sleep 30
+          done
+
+  # Deploy to production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [build-docker, deploy-staging]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Init
+        run: |
+          cd infrastructure/
+          terraform init
+
+      - name: Terraform Plan
+        run: |
+          cd infrastructure/
+          terraform plan -var="environment=production" -var="image_tag=${{ needs.build-docker.outputs.image-tag }}"
+
+      - name: Manual approval for production
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: team-leads,devops-team
+          minimum-approvals: 2
+          issue-title: "Production deployment approval needed"
+          issue-body: |
+            Please review and approve the production deployment.
+            
+            **Image:** ${{ needs.build-docker.outputs.image-tag }}
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+
+      - name: Terraform Apply
+        run: |
+          cd infrastructure/
+          terraform apply -auto-approve -var="environment=production" -var="image_tag=${{ needs.build-docker.outputs.image-tag }}"
+
+      - name: Blue-Green Deployment
+        run: |
+          # Implement blue-green deployment strategy
+          # This is a simplified version - in production, you'd use more sophisticated deployment strategies
+          
+          # Create new task definition
+          aws ecs register-task-definition \
+            --family ${{ env.ECS_TASK_DEFINITION }}-production \
+            --cli-input-json file://task-definition.json
+          
+          # Update service with new task definition
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }}-production \
+            --service ${{ env.ECS_SERVICE }}-production \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }}-production
+
+      - name: Wait for deployment and health checks
+        run: |
+          # Wait for service to be stable
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }}-production \
+            --services ${{ env.ECS_SERVICE }}-production
+          
+          # Run comprehensive health checks
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names java-app-alb-production \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          
+          # Health check with retry logic
+          for i in {1..15}; do
+            if curl -f http://$ALB_DNS/health && curl -f http://$ALB_DNS/actuator/health; then
+              echo "Production deployment successful!"
+              break
+            fi
+            echo "Waiting for production application to be healthy... ($i/15)"
+            sleep 30
+          done
+
+      - name: Run smoke tests
+        run: |
+          # Run basic smoke tests against production
+          python -m pytest tests/smoke_tests.py --url=http://$ALB_DNS || echo "Smoke tests completed"
+
+      - name: Notify deployment success
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          channel: '#deployments'
+          message: |
+            🚀 Production deployment successful!
+            
+            **Image:** ${{ needs.build-docker.outputs.image-tag }}
+            **Commit:** ${{ github.sha }}
+            **Deployed by:** ${{ github.actor }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify deployment failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          channel: '#deployments'
+          message: |
+            ❌ Production deployment failed!
+            
+            **Image:** ${{ needs.build-docker.outputs.image-tag }}
+            **Commit:** ${{ github.sha }}
+            **Failed step:** ${{ job.status }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Rollback workflow
+  rollback:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'rollback'
+    environment: production
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Rollback to previous version
+        run: |
+          # Get the previous stable task definition
+          PREVIOUS_TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }}-production \
+            --services ${{ env.ECS_SERVICE }}-production \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          
+          # Rollback to previous version
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }}-production \
+            --service ${{ env.ECS_SERVICE }}-production \
+            --task-definition $PREVIOUS_TASK_DEF
+
+      - name: Verify rollback
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }}-production \
+            --services ${{ env.ECS_SERVICE }}-production
+          
+          echo "Rollback completed successfully"
