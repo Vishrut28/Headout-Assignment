@@ -1,0 +1,145 @@
+# Docker Compose configuration for local development and testing
+version: '3.8'
+
+services:
+  # Java Application Deployment Service
+  java-app-deployment:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: java-app-deployment
+    ports:
+      - "9000:9000"
+    environment:
+      # Application Configuration
+      - REPO_URL=${REPO_URL:-git@github.com:example/project.git}
+      - REPO_NAME=${REPO_NAME:-project}
+      - BRANCH=${BRANCH:-main}
+      - MONITOR_DURATION=${MONITOR_DURATION:-300}
+      - JAVA_OPTS=-Xmx512m -Xms256m -XX:+UseG1GC
+      
+      # Environment Settings
+      - ENVIRONMENT=development
+      - AWS_REGION=us-east-1
+    volumes:
+      # Mount SSH keys for GitHub access
+      - ~/.ssh:/secrets:ro
+      # Mount application logs
+      - ./logs:/app/logs
+      # Mount data directory (if needed)
+      - ./data:/app/data
+    networks:
+      - app-network
+    depends_on:
+      - monitoring
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/health-check.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Nginx Reverse Proxy (for local development)
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - java-app-deployment
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Log aggregation service
+  fluentd:
+    image: fluent/fluentd:latest
+    container_name: fluentd
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    volumes:
+      - ./fluentd/fluent.conf:/fluentd/etc/fluent.conf:ro
+      - /var/log:/var/log:ro
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Monitoring and alerting service
+  monitoring:
+    build:
+      context: .
+      dockerfile: Dockerfile.monitoring
+    container_name: monitoring-service
+    environment:
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK}
+      - CHECK_INTERVAL=60
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - app-network
+    restart: unless-stopped
+    depends_on:
+      - java-app-deployment
+
+networks:
+  app-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
